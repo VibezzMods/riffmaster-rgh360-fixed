@@ -1,4 +1,4 @@
-#include <xtl.h>
+﻿#include <xtl.h>
 #include <xkelib.h>
 #include <string>
 #include <fstream>
@@ -14,6 +14,22 @@
 #include "gip_riffmaster.h"
 #include "gip_auth.h"
 #include "riffmaster_build.h"
+#include "riffmaster_ps5.h"
+const uint16_t PDP_VENDOR_ID = 0x0E6F;
+const uint16_t RIFFMASTER_DONGLE_PID = 0x0248;
+const uint16_t RIFFMASTER_PS5_PID = 0x0249;   // PS5 Riffmaster
+const uint16_t CRKD_VENDOR_ID_PS   = 0x3651;
+const uint16_t CRKD_VENDOR_ID_XBOX = 0x0351;
+
+static bool IsCrkdDevice(uint16_t vid, uint16_t pid)
+{
+    if (vid == CRKD_VENDOR_ID_PS)
+        return true;
+    if (vid == CRKD_VENDOR_ID_XBOX)
+        return true;
+    (void)pid;
+    return false;
+}
 
 // ---------------------------------------------------------------------------
 // ADDITIVE BUILD LADDER — RIFFMASTER_LEVEL, set by tools/build.ps1 -Level N.
@@ -69,19 +85,6 @@
 #if RIFFMASTER_LEVEL < RM_LVL_USBRESET
 #define RIFFMASTER_NO_USB_RESET 1    // also skips the two bugcheck patches
 #endif
-// The shipping driver does not need the USB stack reset (guitar is powered on after boot).
-// Define RIFFMASTER_FORCE_USB_RESET to restore the old hiddriver360 behaviour.
-#if RIFFMASTER_LEVEL >= RM_LVL_FULL && !defined(RIFFMASTER_FORCE_USB_RESET)
-#define RIFFMASTER_NO_USB_RESET 1
-#endif
-
-// RiffMaster only needs the GIP dongle path. The inherited hiddriver360 HID detours
-// claim any standard USB HID gamepad and launch the "Unknown controller, beginning
-// mapping" assistant, which breaks CRKD and other guitars that UsbdSecPatch should own.
-// Define RIFFMASTER_FORCE_HID to restore the upstream HID/mapping behaviour.
-#if RIFFMASTER_LEVEL >= RM_LVL_FULL && !defined(RIFFMASTER_FORCE_HID)
-#define RIFFMASTER_GIP_ONLY 1
-#endif
 
 // ---------------------------------------------------------------------------
 // Logging levels.
@@ -114,33 +117,6 @@
 #else
 #define RM_DBG(...) ((void)0)
 #endif
-
-// Coexist logging: RM_DBG only. These run inside UsbdAddDeviceComplete (USB
-// completion / raised IRQL). DbgPrint goes out over xbdm and takes the XAM net
-// lock — the same hang class as printing from UsbdRemoveDeviceCompleteHook.
-#define RM_COEXIST_MAX 48
-static int g_coexistLogCount = 0;
-
-static void RmLogCoexistUsb(const char* tag, deviceHandle* h, int status,
-	usb_device_descriptor* dd, usb_interface_descriptor* id) {
-	if (g_coexistLogCount >= RM_COEXIST_MAX || !dd)
-		return;
-	g_coexistLogCount++;
-
-	uint16_t vid = swap_endianness_16(dd->idVendor);
-	uint16_t pid = swap_endianness_16(dd->idProduct);
-	if (id) {
-		RM_DBG("RIFFMASTER: COEXIST %s status=0x%08X h=%p VID=%04X PID=%04X "
-			"iface=%02X/%02X/%02X ep=%d\r\n",
-			tag, status, h, vid, pid,
-			id->bInterfaceClass, id->bInterfaceSubClass, id->bInterfaceProtocol,
-			id->bNumEndpoints);
-	}
-	else {
-		RM_DBG("RIFFMASTER: COEXIST %s status=0x%08X h=%p VID=%04X PID=%04X (no iface)\r\n",
-			tag, status, h, vid, pid);
-	}
-}
 
 // ---------------------------------------------------------------------------
 // USB bugcheck patch save/restore.
@@ -1273,6 +1249,54 @@ int interruptHandler(DWORD deviceHandle, int32_t a2) {
 			buttonReport.dpad_right = (b2 & SWITCH_DPAD_RIGHT) ? 1 : 0;
 		}
 
+		// ========== PS5 RIFFMASTER START ==========
+		else if (connectedControllers[index].vendorId == PDP_VENDOR_ID &&
+			connectedControllers[index].productId == RIFFMASTER_PS5_PID)
+		{
+			GuitarState gs;
+			ParseRiffmasterPS5((const uint8_t*)report,
+				driverExtension->interruptTrb.length, &gs);
+
+			ButtonsReport& b = buttonReport;
+			memset(&b, 0, sizeof(ButtonsReport));
+
+			b.a_button = gs.green ? 1 : 0;
+			b.b_button = gs.red ? 1 : 0;
+			b.y_button = gs.yellow ? 1 : 0;
+			b.x_button = gs.blue ? 1 : 0;
+			b.l1 = gs.orange ? 1 : 0;
+
+			b.dpad_up = gs.strum_up ? 1 : 0;
+			b.dpad_down = gs.strum_down ? 1 : 0;
+			b.has_hat_switch = false;
+
+			b.start = gs.start ? 1 : 0;     // Start button stays Start
+			b.back = gs.select ? 1 : 0;    // Back / Select stays Back
+			b.xbox = gs.guide ? 1 : 0;     // PS button → Xbox / Guide button
+
+						// Whammy: byte 41, rest 0x00, full 0xFF
+			// 360 GH/RB read Right Stick Y
+			uint8_t rawWhammy = gs.whammy;
+			if (rawWhammy < 0x18)
+				rawWhammy = 0;
+
+			int32_t whammy16 = ((int32_t)rawWhammy * 32767) / 255;
+			b.rz = (int16_t)(-whammy16);   // sThumbRY
+			b.ry = rawWhammy;              // also RT, some titles use it
+
+			// Tilt: byte 42, rest ~0x0C, neck-up ~0x80-0xE5
+			// 360 GH/RB read Right Stick X (and LT as backup)
+			if (gs.tilt > 0x80) {
+				b.z = 32767;              // sThumbRX
+				b.rx = 255;                // LT
+			}
+			else {
+				b.z = 0;
+				b.rx = 0;
+			}
+		}
+		// ========== PS5 RIFFMASTER END ==========
+
 		else if (connectedControllers[index].map) {
 			HidFillButtonsReport(
 				payload,
@@ -1554,9 +1578,6 @@ int UsbdGetDeviceSpeedHook(deviceHandle* h) {
 // NOTE: PID 0x0247 is the guitar's BOOTLOADER ("PDP.Xbox.Controller.Bootloader" per
 // refs/PlasticBand/Docs/Descriptor Dumps/Xbox One/PDP Riffmaster Wired (Bootloader).txt)
 // - deliberately NOT matched here.
-const uint16_t PDP_VENDOR_ID        = 0x0E6F;
-const uint16_t RIFFMASTER_DONGLE_PID = 0x0248;
-
 // Budget of claim attempts, NOT reset by teardown - only by a connection that reaches
 // AUTH HANDSHAKE COMPLETE (main.cpp, GIP_CMD_AUTHENTICATE handler).
 //
@@ -1577,7 +1598,7 @@ const uint16_t RIFFMASTER_DONGLE_PID = 0x0248;
 //
 // Capping the storm is a mitigation, not a cure - the real fix is a per-device
 // extension so incarnations cannot share a TRB.
-#define GIP_CLAIM_MAX_ATTEMPTS 8
+#define GIP_CLAIM_MAX_ATTEMPTS 3
 static int g_gipClaimAttempts = 0;
 static HidControllerExtension g_gipExt;
 
@@ -1750,7 +1771,7 @@ static void GipUnregisterFromXam();
 static void GipRsaSelfTest() {
 	// Auth payload = 10-byte header (handshake 6 + data 4) then the DER certificate.
 	if (g_gipCertBytes <= 10) {
-		RM_DBG("RIFFMASTER: RSA selftest skipped - no certificate\r\n");
+		RM_LOG("RIFFMASTER: RSA selftest skipped - no certificate\r\n");
 		return;
 	}
 	const BYTE* der = g_gipCertBuf + 10;
@@ -1759,7 +1780,7 @@ static void GipRsaSelfTest() {
 	static BYTE modulus[RSA2048_BYTES];
 	uint32_t pubExp = 0;
 	if (!GipCertGetRsaPubKey(der, derLen, modulus, &pubExp)) {
-		RM_DBG("RIFFMASTER: RSA selftest FAILED - could not parse pubkey from cert\r\n");
+		RM_LOG("RIFFMASTER: RSA selftest FAILED - could not parse pubkey from cert\r\n");
 		return;
 	}
 	RM_DBG("RIFFMASTER: cert pubkey parsed: exponent=%u modulus starts %02X%02X%02X%02X\r\n",
@@ -1773,30 +1794,21 @@ static void GipRsaSelfTest() {
 	static BYTE outB[RSA2048_BYTES];
 	memset(msg, 0xAA, sizeof(msg));
 	if (!GipPkcs1Pad(msg, sizeof(msg), em, true)) {
-		RM_DBG("RIFFMASTER: RSA selftest FAILED - padding\r\n");
+		RM_LOG("RIFFMASTER: RSA selftest FAILED - padding\r\n");
 		return;
 	}
 
-	// Expected ciphertext for the REFERENCE device's modulus (tools/rsa_check.py).
-	// Other RiffMaster units ship different certs/keys, so this byte compare will
-	// fail on them even when our modexp is correct. Only treat a failed GipRsaPubCrypt
-	// as fatal; a known-answer mismatch is logged and we continue with HOST_SECRET.
-	RM_DBG("RIFFMASTER: --- RSA SELFTEST (reference expect CA FA 27 9B ...) ---\r\n");
+	// Expected ciphertext, computed offline from this modulus by tools/rsa_check.py.
+	// Our own bignum modexp should reproduce it exactly.
+	RM_DBG("RIFFMASTER: --- RSA SELFTEST (expect CA FA 27 9B ...) ---\r\n");
 
 	bool ok = GipRsaPubCrypt(modulus, pubExp, em, outA);
 	static const BYTE expect[8] = { 0xCA,0xFA,0x27,0x9B,0x03,0x68,0x3F,0x84 };
-	bool knownAnswer = ok && !memcmp(outA, expect, 8);
-	if (!ok) {
-		RM_DBG("RIFFMASTER: *** RSA SELFTEST: FAIL (modexp error) ***\r\n");
-		return;
-	}
-	if (knownAnswer)
-		RM_DBG("RIFFMASTER: *** RSA SELFTEST: PASS ***\r\n");
-	else {
-		RM_DBG("RIFFMASTER: *** RSA SELFTEST: PASS (device cert differs from reference) ***\r\n");
-		RM_DBG("RIFFMASTER: known-answer mismatch - not fatal, continuing auth\r\n");
-		if (ok)
-			GipHexDump("rsa", outA, 32);
+	bool pass = ok && !memcmp(outA, expect, 8);
+	RM_LOG("RIFFMASTER: *** RSA SELFTEST: %s ***\r\n", pass ? "PASS" : "FAIL");
+	if (!pass) {
+		if (ok) GipHexDump("rsa", outA, 32);
+		return;                       // do not build a handshake on broken crypto
 	}
 	(void)outB;
 
@@ -1812,11 +1824,11 @@ static void GipRsaSelfTest() {
 	memcpy(g_gipPms, pms, sizeof(pms));      // kept for the PRF / master secret
 
 	if (!GipPkcs1Pad(pms, sizeof(pms), em, false)) {
-		RM_DBG("RIFFMASTER: HOST_SECRET padding failed\r\n");
+		RM_LOG("RIFFMASTER: HOST_SECRET padding failed\r\n");
 		return;
 	}
 	if (!GipRsaPubCrypt(modulus, pubExp, em, pkt + 10)) {
-		RM_DBG("RIFFMASTER: HOST_SECRET RSA failed\r\n");
+		RM_LOG("RIFFMASTER: HOST_SECRET RSA failed\r\n");
 		return;
 	}
 
@@ -1889,26 +1901,11 @@ static void GipRsaSelfTest() {
 // our GIP state. Keeping a separate identity means our branches can run first and the
 // upstream paths are left completely untouched for real HID pads.
 //
-// Separate from hiddriver360's connectedControllers[0..3] slots. HID pads use contexts
-// 0x10000005..0x10000008; the guitar gets its own so four USB gamepads cannot block it.
-static const int      GIP_XAM_BIND_MAGIC = 4;
-static const uint32_t GIP_DEVICE_CONTEXT = 0x0000000010000009;
-
 static uint8_t  g_gipUserIndex = 0xFF;
 static uint32_t g_gipDeviceContext = 0;
 static DWORD    g_gipPacketNumber = 0;
 static int      g_gipCapsLogged = 0;
 static int      g_gipCaps2Logged = 0;
-
-static void RmLogHidSlotSummary() {
-	int used = 0;
-	for (int i = 0; i < (int)(sizeof(connectedControllers) / sizeof(Controller)); i++) {
-		if (connectedControllers[i].controllerDriver)
-			used++;
-	}
-	RM_DBG("RIFFMASTER: COEXIST HID slots in use: %d/4  GIP XAM user=%d\r\n",
-		used, (g_gipUserIndex == 0xFF) ? -1 : (int)g_gipUserIndex);
-}
 
 //
 // Fill the capability fields the way a REAL Xbox 360 guitar reports them.
@@ -2113,26 +2110,35 @@ static void GipRegisterWithXam() {
 	if (g_gipUserIndex != 0xFF)
 		return;                       // already registered
 
-	uint8_t userIndex = 0xFF;
-	XamUserBindDeviceCallback(0xa7553952 + GIP_XAM_BIND_MAGIC, GIP_DEVICE_CONTEXT, 0, false, &userIndex);
-
-	if (userIndex == 0xFF || userIndex >= 4) {
-		RM_DBG("RIFFMASTER: XAM bind FAILED (userIndex=%d) - unplug other controllers and hard reboot\r\n",
-			userIndex);
+	// Pick a slot hiddriver360 is not using so a real pad and the guitar cannot
+	// collide on the same XAM index.
+	int idx = -1;
+	for (int i = 0; i < (int)(sizeof(connectedControllers) / sizeof(Controller)); i++) {
+		if (!connectedControllers[i].controllerDriver) {
+			idx = i;
+			break;
+		}
+	}
+	if (idx < 0) {
+		RM_LOG("RIFFMASTER: no free XAM slot!\r\n");
 		return;
 	}
 
+	uint8_t userIndex = 0xFF;
+	uint32_t context = 0x0000000010000005 + idx;
+	XamUserBindDeviceCallback(0xa7553952 + idx, context, 0, false, &userIndex);
+
 	g_gipUserIndex = userIndex;
-	g_gipDeviceContext = GIP_DEVICE_CONTEXT;
-	RM_DBG("RIFFMASTER: *** registered virtual GUITAR in XAM, user index %d ***\r\n",
+	g_gipDeviceContext = context;
+	RM_LOG("RIFFMASTER: *** registered virtual GUITAR in XAM, user index %d ***\r\n",
 		userIndex);
-	RmLogHidSlotSummary();
 }
 
 static void GipUnregisterFromXam() {
 	if (g_gipUserIndex == 0xFF)
 		return;
-	XamUserBindDeviceCallback(0xa7553952 + GIP_XAM_BIND_MAGIC, GIP_DEVICE_CONTEXT, 0, true, 0);
+	int idx = (int)(g_gipDeviceContext - 0x0000000010000005);
+	XamUserBindDeviceCallback(0xa7553952 + idx, g_gipDeviceContext, 0, true, 0);
 	// RM_DBG, not RM_LOG: only caller is UsbdRemoveDeviceCompleteHook, and DbgPrint
 	// inside the USB removal completion is the freeze suspect. See the banner there.
 	RM_DBG("RIFFMASTER: removed virtual guitar from XAM\r\n");
@@ -2571,7 +2577,7 @@ static void GipHandleTransfer(const BYTE* data, int len) {
 						GipSend(g_gipExt.deviceHandle, GIP_CMD_AUTHENTICATE,
 							GIP_OPT_INTERNAL, done, sizeof(done));
 						g_gipAuthStage = 7;
-						RM_DBG("RIFFMASTER: *** AUTH HANDSHAKE COMPLETE ***\r\n");
+						RM_LOG("RIFFMASTER: *** AUTH HANDSHAKE COMPLETE ***\r\n");
 						// A connection that got all the way to auth is a REAL one, so
 						// refresh the claim budget here rather than in teardown. See the
 						// banner on GIP_CLAIM_MAX_ATTEMPTS: resetting on teardown let a
@@ -2590,7 +2596,7 @@ static void GipHandleTransfer(const BYTE* data, int len) {
 					GipSendAck(g_gipExt.deviceHandle, &hdr);
 
 				if (payload[2] != 0x00)
-					RM_DBG("RIFFMASTER: !!! device reported auth error 0x%02X !!!\r\n", payload[2]);
+					RM_LOG("RIFFMASTER: !!! device reported auth error 0x%02X !!!\r\n", payload[2]);
 
 				// Device acknowledged HOST_HELLO at the auth layer
 				// (capture: 00 C1 00 01 00 00). Now request its hello.
@@ -2741,7 +2747,7 @@ int32_t GipInterruptComplete(DWORD trbAddr, int32_t status) {
 		static bool reported = false;
 		if (!reported) {
 			reported = true;
-			RM_DBG("RIFFMASTER: read loop STOPPED after %d unproductive completions "
+			RM_LOG("RIFFMASTER: read loop STOPPED after %d unproductive completions "
 				"(last status 0x%08X) - disconnect guard fired\r\n",
 				GIP_MAX_CONSECUTIVE_READ_ERRORS, status);
 		}
@@ -2783,7 +2789,7 @@ int32_t GipInterruptComplete(DWORD trbAddr, int32_t status) {
 int32_t GipSetConfigComplete(DWORD trbAddr, int32_t status) {
 	HidControllerExtension* ext = (HidControllerExtension*)((BYTE*)trbAddr - 36);
 
-	RM_DBG("RIFFMASTER: SET_CONFIGURATION completed status=0x%08X\r\n", status);
+	RM_LOG("RIFFMASTER: SET_CONFIGURATION completed status=0x%08X\r\n", status);
 	if (status != 0)
 		return status;
 
@@ -2836,10 +2842,10 @@ int32_t GipSetConfigComplete(DWORD trbAddr, int32_t status) {
 	NTSTATUS s = UsbdOpenEndpoint(ext->deviceHandle, USB_ENDPOINT_TYPE_INTERRUPT,
 		epAddr, pkt, interval, (DWORD*)&ext->interruptTrb);
 	if (NT_ERROR(s)) {
-		RM_DBG("RIFFMASTER: UsbdOpenEndpoint FAILED 0x%08X\r\n", s);
+		RM_LOG("RIFFMASTER: UsbdOpenEndpoint FAILED 0x%08X\r\n", s);
 		return s;
 	}
-	RM_DBG("RIFFMASTER: *** interrupt IN endpoint OPEN - starting GIP reads ***\r\n");
+	RM_LOG("RIFFMASTER: *** interrupt IN endpoint OPEN - starting GIP reads ***\r\n");
 
 	// Open the interrupt OUT endpoint too - without it we can never answer ANNOUNCE.
 	// EP 0x02 OUT, INTERRUPT, 64, bInterval 4 (docs/gip_riffmaster.md section 2).
@@ -2857,7 +2863,7 @@ int32_t GipSetConfigComplete(DWORD trbAddr, int32_t status) {
 		NTSTATUS os = UsbdOpenEndpoint(ext->deviceHandle, USB_ENDPOINT_TYPE_INTERRUPT,
 			outAddr, outPkt, outInterval, (DWORD*)&g_gipOutTrb);
 		g_gipOutOpen = !NT_ERROR(os);
-		RM_DBG("RIFFMASTER: interrupt OUT EP %02X -> 0x%08X %s\r\n",
+		RM_LOG("RIFFMASTER: interrupt OUT EP %02X -> 0x%08X %s\r\n",
 			outAddr, os, g_gipOutOpen ? "OK" : "FAILED");
 	}
 
@@ -2872,7 +2878,7 @@ int32_t GipSetConfigComplete(DWORD trbAddr, int32_t status) {
 	// This is the split that should have come before any attempted fix: it separates
 	// "having claimed the device and opened its endpoints" from "servicing it". The
 	// guitar will not work - no reads means no input and no auth.
-	RM_DBG("RIFFMASTER: interrupt reads NOT started (noread variant)\r\n");
+	RM_LOG("RIFFMASTER: interrupt reads NOT started (noread variant)\r\n");
 	return 0;
 #endif
 	memset(g_gipReadBuf, 0, sizeof(g_gipReadBuf));
@@ -2897,8 +2903,6 @@ int UsbdAddDeviceCompleteHook(deviceHandle* h, int status) {
 	RM_DBG("RIFFMASTER: ADDCOMPLETE handle=%p status=0x%08X (%s) driver=%p\r\n",
 		h, status, (status == 0) ? "CLAIMED" : "not claimed",
 		h ? h->driver : 0);
-
-	RmLogCoexistUsb("USB-ADDCOMPLETE", h, status, dd, id);
 
 	if (dd)
 		RM_DBG("RIFFMASTER:   dev VID=%04X PID=%04X class=%02X/%02X/%02X\r\n",
@@ -2943,30 +2947,15 @@ int UsbdAddDeviceCompleteHook(deviceHandle* h, int status) {
 	if (s_claimedOnce && status != 0)
 		return UsbdAddDeviceCompleteDetour.GetOriginal<decltype(&UsbdAddDeviceCompleteHook)>()(h, status);
 #endif
-	if (status != 0 && dd && h) {
+	if (status != 0 && dd && id && h && g_gipClaimAttempts < GIP_CLAIM_MAX_ATTEMPTS) {
 		uint16_t vid = swap_endianness_16(dd->idVendor);
 		uint16_t pid = swap_endianness_16(dd->idProduct);
-		const bool isRiffMasterDongle = (vid == PDP_VENDOR_ID && pid == RIFFMASTER_DONGLE_PID);
 
-		if (!isRiffMasterDongle) {
-			RmLogCoexistUsb("USB-PASS (not RiffMaster dongle)", h, status, dd, id);
-		}
-
-		if (isRiffMasterDongle && g_gipClaimAttempts >= GIP_CLAIM_MAX_ATTEMPTS) {
-			static bool s_claimExhaustedLogged = false;
-			if (!s_claimExhaustedLogged) {
-				s_claimExhaustedLogged = true;
-				RM_DBG("RIFFMASTER: RiffMaster dongle detected but NOT claimed "
-					"(budget %d exhausted) - hard reboot, then plug dongle AFTER boot\r\n",
-					GIP_CLAIM_MAX_ATTEMPTS);
-			}
-		}
-		else if (id && g_gipClaimAttempts < GIP_CLAIM_MAX_ATTEMPTS) {
-			if (isRiffMasterDongle &&
-				id->bInterfaceClass == 0xFF && id->bInterfaceSubClass == 0x47 &&
-				id->bInterfaceProtocol == 0xD0 &&
-				id->bInterfaceNumber == 0 &&    // interface 0 = GIP data
-				id->bNumEndpoints == 2) {       // interface 1 (audio) has 0 in alt 0 - skip it
+		if (vid == PDP_VENDOR_ID && pid == RIFFMASTER_DONGLE_PID &&
+			id->bInterfaceClass == 0xFF && id->bInterfaceSubClass == 0x47 &&
+			id->bInterfaceProtocol == 0xD0 &&
+			id->bInterfaceNumber == 0 &&    // interface 0 = GIP data
+			id->bNumEndpoints == 2) {       // interface 1 (audio) has 0 in alt 0 - skip it
 
 			g_gipClaimAttempts++;
 #ifdef RIFFMASTER_CLAIM_ONCE
@@ -2978,9 +2967,8 @@ int UsbdAddDeviceCompleteHook(deviceHandle* h, int status) {
 			// re-claimed silently". Under `trace` the claim is always visible.
 			RM_TRACE("RIFFMASTER: TRACE CLAIM ATTEMPT %d handle=%p\r\n",
 				g_gipClaimAttempts, h);
-			RM_DBG("RIFFMASTER: *** CLAIM ATTEMPT %d on RiffMaster dongle (handle %p) ***\r\n",
+			RM_DBG("RIFFMASTER: *** CLAIM ATTEMPT %d on GIP dongle (handle %p) ***\r\n",
 				g_gipClaimAttempts, h);
-			RmLogCoexistUsb("USB-CLAIM RiffMaster GIP dongle", h, status, dd, id);
 
 			// Statically allocated rather than new'd: we do not know the IRQL this
 			// callback runs at, and a failed allocation here would be a hang.
@@ -3029,7 +3017,7 @@ int UsbdAddDeviceCompleteHook(deviceHandle* h, int status) {
 			int r = 0;
 #elif defined(RIFFMASTER_NO_CLAIM)
 			int r = UsbdAddDeviceCompleteDetour.GetOriginal<decltype(&UsbdAddDeviceCompleteHook)>()(h, status);
-			RM_DBG("RIFFMASTER: NOT claiming - passed original status 0x%08X through, "
+			RM_LOG("RIFFMASTER: NOT claiming - passed original status 0x%08X through, "
 				"driver stays %p\r\n", status, h->driver);
 #elif defined(RIFFMASTER_KEEP_DRIVER)
 			// Claim the device - so the core keeps scheduling transfers for it - but do
@@ -3047,7 +3035,7 @@ int UsbdAddDeviceCompleteHook(deviceHandle* h, int status) {
 			// to find rather than replacing it with a pointer into our plugin.
 			void* before = h->driver;
 			int r = UsbdAddDeviceCompleteDetour.GetOriginal<decltype(&UsbdAddDeviceCompleteHook)>()(h, 0);
-			RM_DBG("RIFFMASTER: claimed WITHOUT touching driver - was %p, now %p\r\n",
+			RM_LOG("RIFFMASTER: claimed WITHOUT touching driver - was %p, now %p\r\n",
 				before, h->driver);
 #else
 			h->driver = &g_gipExt;
@@ -3066,13 +3054,13 @@ int UsbdAddDeviceCompleteHook(deviceHandle* h, int status) {
 			// fault is in OPENING endpoints on a device we claimed this way. If it
 			// freezes, the bare claim is sufficient and the problem is that the core
 			// believes a driver owns a device that has none.
-			RM_DBG("RIFFMASTER: claimed and stopped (claimonly variant)\r\n");
+			RM_LOG("RIFFMASTER: claimed and stopped (claimonly variant)\r\n");
 			return r;
 #endif
 			NTSTATUS s = UsbdOpenDefaultEndpoint(h, (DWORD*)&g_gipExt.controlTrb);
 			// RM_LOG, not RM_DBG: under NO_CLAIM this is the whole question - whether
 			// the core will open an endpoint on a device it considers unowned.
-			RM_DBG("RIFFMASTER: UsbdOpenDefaultEndpoint -> 0x%08X %s\r\n",
+			RM_LOG("RIFFMASTER: UsbdOpenDefaultEndpoint -> 0x%08X %s\r\n",
 				s, NT_ERROR(s) ? "FAILED" : "OK");
 			if (NT_ERROR(s))
 				return r;
@@ -3093,17 +3081,16 @@ int UsbdAddDeviceCompleteHook(deviceHandle* h, int status) {
 			// So the queue call accepts the transfer either way, and the difference is
 			// purely whether the core ever SERVICES it. Do not read this as success or
 			// failure - it is only here to prove the call was reached and returned.
-			RM_DBG("RIFFMASTER: SET_CONFIGURATION queued -> 0x%08X (not a status)\r\n", q);
+			RM_LOG("RIFFMASTER: SET_CONFIGURATION queued -> 0x%08X (not a status)\r\n", q);
 
 #ifdef RIFFMASTER_NO_CLAIM_LATE
 			// Only now tell the core the device was not claimed - after our endpoints
 			// are open and the control transfer is already queued.
 			r = UsbdAddDeviceCompleteDetour.GetOriginal<decltype(&UsbdAddDeviceCompleteHook)>()(h, status);
-			RM_DBG("RIFFMASTER: deferred unclaim - reported 0x%08X after setup, driver=%p\r\n",
+			RM_LOG("RIFFMASTER: deferred unclaim - reported 0x%08X after setup, driver=%p\r\n",
 				status, h->driver);
 #endif
 			return r;
-		}
 		}
 	}
 
@@ -3356,31 +3343,35 @@ static void InstallUsbProbes() {
 
 int reportData = 0;
 int HidAddDeviceHook(deviceHandle* deviceHandle) {
+	DbgPrint("EINTIM: HID add device %p\n", deviceHandle);
 	usb_device_descriptor* device_descriptor = UsbdGetDeviceDescriptor(deviceHandle);
 	usb_interface_descriptor* interface_descriptor = UsbdGetInterfaceDescriptor(deviceHandle);
-
-	uint16_t vendorId = device_descriptor ?
-		swap_endianness_16(device_descriptor->idVendor) : 0;
-	uint16_t productId = device_descriptor ?
-		swap_endianness_16(device_descriptor->idProduct) : 0;
-
-	RM_DBG("RIFFMASTER: COEXIST HID hook saw h=%p VID=%04X PID=%04X\r\n",
-		deviceHandle, vendorId, productId);
 
 	// Kill test: log EVERY device that gets here, before any class filtering.
 	KtLogDevice(deviceHandle, device_descriptor, interface_descriptor);
 
+	uint16_t vendorId = swap_endianness_16(device_descriptor->idVendor);
+	uint16_t productId = swap_endianness_16(device_descriptor->idProduct);
+
+	// Leave XInput / UsbdSecPatch devices alone. Only claim the PS5 Riffmaster HID.
+	if (IsCrkdDevice(vendorId, productId) ||
+		!(vendorId == PDP_VENDOR_ID && productId == RIFFMASTER_PS5_PID))
+	{
+		DbgPrint("RIFFMASTER: pass-through VID=%04X PID=%04X\n", vendorId, productId);
+		return HidAddDeviceDetour.GetOriginal<decltype(&HidAddDeviceHook)>()(deviceHandle);
+	}
+
 	int speed = UsbdGetDeviceSpeed(deviceHandle);
 	bool isOhci = speed == 0;
 
-	RM_DBG("RIFFMASTER: HID hook USB1.0=%d desc=%p\r\n", isOhci, device_descriptor);
+	DbgPrint("EINTIM: IS USB1.0: %d\n", isOhci);
+	DbgPrint("EINTIM: USB device descriptor Pointer: %p\n", device_descriptor);
+	DbgPrint("EINTIM: HID device vendor id: %x, product id: %x\n", vendorId, productId);
 
-	if (interface_descriptor &&
-		interface_descriptor->bInterfaceClass == 0x03 &&
+	if (interface_descriptor->bInterfaceClass == 0x03 &&
 		interface_descriptor->bInterfaceSubClass == 0 &&
 		interface_descriptor->bInterfaceProtocol == 0) {
-		RM_DBG("RIFFMASTER: COEXIST HID CLAIM VID=%04X PID=%04X - riffmaster takes this "
-			"device (UsbdSecPatch / CRKD cannot use it)\r\n", vendorId, productId);
+		DbgPrint("EINTIM: Controller detected. Initialising custom handler.\n");
 		
 		// Extract HID descriptor from memory right after interface descriptor
 		BYTE* hid_descriptor_ptr = ((BYTE*)interface_descriptor) + interface_descriptor->bLength;
@@ -3405,9 +3396,8 @@ int HidAddDeviceHook(deviceHandle* deviceHandle) {
 		}
 
 		if (index == -1) {
-			RM_DBG("RIFFMASTER: COEXIST HID CLAIM FAILED - all 4 HID slots full "
-				"(passing CRKD/other to kernel)\r\n");
-			RmLogHidSlotSummary();
+			DbgPrint("EINTIM: No free index!\n");
+			RM_DBG("RIFFMASTER: DROP REASON = all 4 controller slots in use\r\n");
 			return HidAddDeviceDetour.GetOriginal<decltype(&HidAddDeviceHook)>()(deviceHandle);
 		}
 		globalIndex = index;
@@ -3420,6 +3410,10 @@ int HidAddDeviceHook(deviceHandle* deviceHandle) {
 		c.productId = productId;
 		c.map = FindMapping(vendorId, productId);
 		c.nintendo_handshake_state = NINTENDO_HANDSHAKE_STATE::INITIAL;
+
+		uint16_t vendorId  = swap_endianness_16(device_descriptor->idVendor);
+		uint16_t productId = swap_endianness_16(device_descriptor->idProduct);
+
 
 		HidControllerExtension* controllerDriver = new HidControllerExtension();
 		c.deviceHandle = deviceHandle;
@@ -3454,16 +3448,10 @@ int HidAddDeviceHook(deviceHandle* deviceHandle) {
 			nullptr,
 			(DWORD)setConfigurationComplete);
 
-		RmLogHidSlotSummary();
 		return 0;
 	}
 
-	RM_DBG("RIFFMASTER: COEXIST HID pass-through VID=%04X PID=%04X class=%02X/%02X/%02X "
-		"(not claiming - UsbdSecPatch may handle)\r\n",
-		vendorId, productId,
-		interface_descriptor ? interface_descriptor->bInterfaceClass : 0xFF,
-		interface_descriptor ? interface_descriptor->bInterfaceSubClass : 0xFF,
-		interface_descriptor ? interface_descriptor->bInterfaceProtocol : 0xFF);
+	DbgPrint("EINTIM: Unrelated USB Device. Calling original...\n");
 	RM_DBG("RIFFMASTER: DROP REASON = interface is not HID (class/subclass/protocol != 03/00/00). "
 		"Saw %02X/%02X/%02X. Device DID reach the hook.\r\n",
 		interface_descriptor ? interface_descriptor->bInterfaceClass : 0xFF,
@@ -3504,14 +3492,8 @@ DWORD XamInputGetCapabilitiesExHook(DWORD unk, DWORD user, DWORD flags, XINPUT_C
 	if (!capabilities)
 		return status;
 
-	// ---- RiffMaster: report a GUITAR, not a gamepad ----------------------
-	// This runs before hiddriver360's own path so real HID pads keep reporting
-	// XINPUT_DEVSUBTYPE_GAMEPAD. rb1wiidrums replaced the SubType unconditionally,
-	// which would have made every controller claim to be an instrument
-	// (docs/rb1wii_analysis.md hunk 5).
+	// ---- GIP RiffMaster ----
 	if (g_gipUserIndex != 0xFF && user == g_gipUserIndex && g_gipAuthStage == 7) {
-		// Rate limited: the dash/game polls capabilities many times per second, and
-		// logging every call floods xbdm and hangs the console.
 		if (g_gipCapsLogged < 3) {
 			g_gipCapsLogged++;
 			RM_DBG("RIFFMASTER: XamInputGetCapabilitiesEx(user=%d) -> GUITAR\r\n", user);
@@ -3523,6 +3505,28 @@ DWORD XamInputGetCapabilitiesExHook(DWORD unk, DWORD user, DWORD flags, XINPUT_C
 		return ERROR_SUCCESS;
 	}
 
+	// ---- PS5 Riffmaster (HID) ----
+	{
+		Controller* c = nullptr;
+		for (int i = 0; i < 4; i++) {
+			if (connectedControllers[i].controllerDriver &&
+				connectedControllers[i].userIndex == user &&
+				connectedControllers[i].vendorId == PDP_VENDOR_ID &&
+				connectedControllers[i].productId == RIFFMASTER_PS5_PID) {
+				c = &connectedControllers[i];
+				break;
+			}
+		}
+		if (c) {
+			GipFillGuitarCaps(capabilities->Type, capabilities->SubType,
+				capabilities->Flags, capabilities->Gamepad);
+			capabilities->Vibration.wLeftMotorSpeed = 0;
+			capabilities->Vibration.wRightMotorSpeed = 0;
+			return ERROR_SUCCESS;
+		}
+	}
+
+	// Original HID gamepad path
 	if (status == ERROR_DEVICE_NOT_CONNECTED) {
 		Controller* c = nullptr;
 		for (int i = 0; i < (sizeof(connectedControllers) / sizeof(Controller)); i++) {
@@ -3548,13 +3552,6 @@ DWORD XamInputGetCapabilitiesExHook(DWORD unk, DWORD user, DWORD flags, XINPUT_C
 		return ERROR_SUCCESS;
 	}
 
-	// UPSTREAM BUG, inherited verbatim (verified against 6159866: the function ends
-	// right here with no return). Every call about a REAL, CONNECTED controller —
-	// which is the overwhelmingly common case, ~8 per 100 ms from the dash — falls off
-	// the end of a non-void function, so the caller reads whatever r3 happens to hold.
-	// It has worked by accident because MSVC leaves `status` in r3 on this path, but
-	// that is a register-allocation coincidence, not a guarantee, and it changes with
-	// any edit to the function.
 	return status;
 }
 
@@ -3583,6 +3580,7 @@ DWORD XamInputGetCapabilitiesHook(DWORD user, DWORD flags, XINPUT_CAPABILITIES* 
 	if (!caps)
 		return status;
 
+	// GIP Riffmaster (existing)
 	if (g_gipUserIndex != 0xFF && user == g_gipUserIndex && g_gipAuthStage == 7) {
 		if (g_gipCaps2Logged < 3) {
 			g_gipCaps2Logged++;
@@ -3594,6 +3592,28 @@ DWORD XamInputGetCapabilitiesHook(DWORD user, DWORD flags, XINPUT_CAPABILITIES* 
 		caps->Vibration.wRightMotorSpeed = 0;
 		return ERROR_SUCCESS;
 	}
+
+	// ========== PS5 Riffmaster (HID) ==========
+	{
+		Controller* c = nullptr;
+		for (int i = 0; i < 4; i++) {
+			if (connectedControllers[i].controllerDriver &&
+				connectedControllers[i].userIndex == user &&
+				connectedControllers[i].vendorId == PDP_VENDOR_ID &&
+				connectedControllers[i].productId == RIFFMASTER_PS5_PID) {
+				c = &connectedControllers[i];
+				break;
+			}
+		}
+		if (c) {
+			GipFillGuitarCaps(caps->Type, caps->SubType, caps->Flags, caps->Gamepad);
+			caps->Vibration.wLeftMotorSpeed = 0;
+			caps->Vibration.wRightMotorSpeed = 0;
+			return ERROR_SUCCESS;
+		}
+	}
+	// ========== END PS5 ==========
+
 	return status;
 }
 
@@ -3615,9 +3635,6 @@ DWORD XamInputGetStateHook(DWORD user, DWORD flags, XINPUT_STATE* state) {
 }
 
 NTSTATUS XInputdReadStateHook(DWORD dwDeviceContext, PDWORD pdwPacketNumber, PXINPUT_GAMEPAD pInputData, PBOOL unk) {
-	// ---- RiffMaster: synthesize a 360 guitar report ----------------------
-	// Checked before hiddriver360's own lookup: our state comes from the GIP parser,
-	// not from its HID ButtonsReport.
 	if (g_gipUserIndex != 0xFF && g_gipAuthStage == 7 &&
 		dwDeviceContext == g_gipDeviceContext) {
 		if (!pInputData)
@@ -3625,10 +3642,6 @@ NTSTATUS XInputdReadStateHook(DWORD dwDeviceContext, PDWORD pdwPacketNumber, PXI
 
 		RiffmasterToXInput(&g_gipState, pInputData);
 
-		// Guide arrives as a separate GIP 0x07 packet, not in the input report.
-		// Both the behaviour and the repeat cooldown are configurable: the blade opening
-		// by accident mid-song is exactly the kind of thing one person will hit and
-		// nobody else will.
 		if (g_gipState.guide && g_rmCfg.guideButton) {
 			static DWORD lastGuide = 0;
 			DWORD now = GetTickCount();
@@ -3643,109 +3656,97 @@ NTSTATUS XInputdReadStateHook(DWORD dwDeviceContext, PDWORD pdwPacketNumber, PXI
 		return ERROR_SUCCESS;
 	}
 
-	// HID virtual-pad path. In GIP-only mode we never claim HID devices, so this
-	// range must NOT swallow real UsbdSecPatch instruments (CRKD guitar uses the
-	// same 0x10000005+ XAM contexts). Fall through to the original so native
-	// devices keep working. The GIP guitar is handled above via exact context match.
-#ifdef RIFFMASTER_GIP_ONLY
-	return XInputdReadStateDetour.GetOriginal<decltype(&XInputdReadStateHook)>()(dwDeviceContext, pdwPacketNumber, pInputData, unk);
-#endif
-	if (dwDeviceContext >= 0x0000000010000005) {
-		if (!pInputData)
-			return ERROR_INVALID_PARAMETER;
-
-		static DWORD lastPressTime = 0;
-		static const DWORD cooldownDuration = 1000;
-
-		ButtonsReport b;
-		Controller* c = nullptr;
-		for (int i = 0; i < (sizeof(connectedControllers) / sizeof(Controller)); i++) {
-			if (connectedControllers[i].controllerDriver &&
-				connectedControllers[i].deviceContext == dwDeviceContext) {
-				c = &connectedControllers[i];
-				b = connectedControllers[i].currentState;
-				break;
-			}
+	Controller* c = nullptr;
+	for (int i = 0; i < 4; i++) {
+		if (connectedControllers[i].controllerDriver &&
+			connectedControllers[i].deviceContext == dwDeviceContext) {
+			c = &connectedControllers[i];
+			break;
 		}
-
-		if (!c)
-			return XInputdReadStateDetour.GetOriginal<decltype(&XInputdReadStateHook)>()(dwDeviceContext, pdwPacketNumber, pInputData, unk);
-
-		if (b.xbox) {
-			DWORD now = GetTickCount();
-			if (now - lastPressTime >= cooldownDuration) {
-				lastPressTime = now;
-				XamInputSendXenonButtonPress(c->userIndex);
-			}
-		}
-
-		if (b.a_button)    pInputData->wButtons |= XINPUT_GAMEPAD_A;
-		if (b.b_button)   pInputData->wButtons |= XINPUT_GAMEPAD_B;
-		if (b.y_button) pInputData->wButtons |= XINPUT_GAMEPAD_Y;
-		if (b.x_button)   pInputData->wButtons |= XINPUT_GAMEPAD_X;
-		if (b.start)    pInputData->wButtons |= XINPUT_GAMEPAD_START;
-		if (b.back)     pInputData->wButtons |= XINPUT_GAMEPAD_BACK;
-		if (b.r3)       pInputData->wButtons |= XINPUT_GAMEPAD_RIGHT_THUMB;
-		if (b.l3)       pInputData->wButtons |= XINPUT_GAMEPAD_LEFT_THUMB;
-		if (b.l1)       pInputData->wButtons |= XINPUT_GAMEPAD_LEFT_SHOULDER;
-		if (b.r1)       pInputData->wButtons |= XINPUT_GAMEPAD_RIGHT_SHOULDER;
-
-		if (b.has_hat_switch) {
-			switch (b.hatSwitch) {
-			case HatSwitch::HAT_UP:
-				pInputData->wButtons |= XINPUT_GAMEPAD_DPAD_UP;
-				break;
-			case HatSwitch::HAT_UP_RIGHT:
-				pInputData->wButtons |= XINPUT_GAMEPAD_DPAD_UP | XINPUT_GAMEPAD_DPAD_RIGHT;
-				break;
-			case HatSwitch::HAT_RIGHT:
-				pInputData->wButtons |= XINPUT_GAMEPAD_DPAD_RIGHT;
-				break;
-			case HatSwitch::HAT_DOWN_RIGHT:
-				pInputData->wButtons |= XINPUT_GAMEPAD_DPAD_DOWN | XINPUT_GAMEPAD_DPAD_RIGHT;
-				break;
-			case HatSwitch::HAT_DOWN:
-				pInputData->wButtons |= XINPUT_GAMEPAD_DPAD_DOWN;
-				break;
-			case HatSwitch::HAT_DOWN_LEFT:
-				pInputData->wButtons |= XINPUT_GAMEPAD_DPAD_DOWN | XINPUT_GAMEPAD_DPAD_LEFT;
-				break;
-			case HatSwitch::HAT_LEFT:
-				pInputData->wButtons |= XINPUT_GAMEPAD_DPAD_LEFT;
-				break;
-			case HatSwitch::HAT_UP_LEFT:
-				pInputData->wButtons |= XINPUT_GAMEPAD_DPAD_UP | XINPUT_GAMEPAD_DPAD_LEFT;
-				break;
-			case HatSwitch::HAT_NEUTRAL:
-				break;
-			}
-		}
-		else {
-			if(b.dpad_left)
-				pInputData->wButtons |= XINPUT_GAMEPAD_DPAD_LEFT;
-			if(b.dpad_right)
-				pInputData->wButtons |= XINPUT_GAMEPAD_DPAD_RIGHT;
-			if(b.dpad_up)
-				pInputData->wButtons |= XINPUT_GAMEPAD_DPAD_UP;
-			if(b.dpad_down)
-				pInputData->wButtons |= XINPUT_GAMEPAD_DPAD_DOWN;
-		}
-		
-		pInputData->sThumbRX = b.z;
-		pInputData->sThumbRY = b.rz;
-		pInputData->sThumbLX = b.x;
-		pInputData->sThumbLY = b.y;
-		pInputData->bLeftTrigger = b.rx ? b.rx : (b.l2 ? 255 : 0);
-		pInputData->bRightTrigger = b.ry ? b.ry : (b.r2 ? 255 : 0);
-
-		if (pdwPacketNumber)
-			*pdwPacketNumber = ++c->packetNumber;
-		if (unk)
-			*unk = FALSE;
-
-		return STATUS_SUCCESS;
 	}
-	return XInputdReadStateDetour.GetOriginal<decltype(&XInputdReadStateHook)>()(dwDeviceContext, pdwPacketNumber, pInputData, unk);
+
+	if (!c) {
+		return XInputdReadStateDetour.GetOriginal<decltype(&XInputdReadStateHook)>()(
+			dwDeviceContext, pdwPacketNumber, pInputData, unk);
+	}
+
+	if (!pInputData)
+		return ERROR_INVALID_PARAMETER;
+
+	memset(pInputData, 0, sizeof(XINPUT_GAMEPAD));
+
+	ButtonsReport b = c->currentState;
+
+	if (b.xbox) {
+		static DWORD lastPressTime = 0;
+		DWORD now = GetTickCount();
+		if (now - lastPressTime >= 1000) {
+			lastPressTime = now;
+			XamInputSendXenonButtonPress(c->userIndex);
+		}
+	}
+
+	if (b.a_button) pInputData->wButtons |= XINPUT_GAMEPAD_A;
+	if (b.b_button) pInputData->wButtons |= XINPUT_GAMEPAD_B;
+	if (b.y_button) pInputData->wButtons |= XINPUT_GAMEPAD_Y;
+	if (b.x_button) pInputData->wButtons |= XINPUT_GAMEPAD_X;
+	if (b.start)    pInputData->wButtons |= XINPUT_GAMEPAD_START;
+	if (b.back)     pInputData->wButtons |= XINPUT_GAMEPAD_BACK;
+	if (b.r3)       pInputData->wButtons |= XINPUT_GAMEPAD_RIGHT_THUMB;
+	if (b.l3)       pInputData->wButtons |= XINPUT_GAMEPAD_LEFT_THUMB;
+	if (b.l1)       pInputData->wButtons |= XINPUT_GAMEPAD_LEFT_SHOULDER;
+	if (b.r1)       pInputData->wButtons |= XINPUT_GAMEPAD_RIGHT_SHOULDER;
+
+	if (b.has_hat_switch) {
+		switch (b.hatSwitch) {
+		case HatSwitch::HAT_UP:
+			pInputData->wButtons |= XINPUT_GAMEPAD_DPAD_UP;
+			break;
+		case HatSwitch::HAT_UP_RIGHT:
+			pInputData->wButtons |= XINPUT_GAMEPAD_DPAD_UP | XINPUT_GAMEPAD_DPAD_RIGHT;
+			break;
+		case HatSwitch::HAT_RIGHT:
+			pInputData->wButtons |= XINPUT_GAMEPAD_DPAD_RIGHT;
+			break;
+		case HatSwitch::HAT_DOWN_RIGHT:
+			pInputData->wButtons |= XINPUT_GAMEPAD_DPAD_DOWN | XINPUT_GAMEPAD_DPAD_RIGHT;
+			break;
+		case HatSwitch::HAT_DOWN:
+			pInputData->wButtons |= XINPUT_GAMEPAD_DPAD_DOWN;
+			break;
+		case HatSwitch::HAT_DOWN_LEFT:
+			pInputData->wButtons |= XINPUT_GAMEPAD_DPAD_DOWN | XINPUT_GAMEPAD_DPAD_LEFT;
+			break;
+		case HatSwitch::HAT_LEFT:
+			pInputData->wButtons |= XINPUT_GAMEPAD_DPAD_LEFT;
+			break;
+		case HatSwitch::HAT_UP_LEFT:
+			pInputData->wButtons |= XINPUT_GAMEPAD_DPAD_UP | XINPUT_GAMEPAD_DPAD_LEFT;
+			break;
+		default:
+			break;
+		}
+	}
+	else {
+		if (b.dpad_left)  pInputData->wButtons |= XINPUT_GAMEPAD_DPAD_LEFT;
+		if (b.dpad_right) pInputData->wButtons |= XINPUT_GAMEPAD_DPAD_RIGHT;
+		if (b.dpad_up)    pInputData->wButtons |= XINPUT_GAMEPAD_DPAD_UP;
+		if (b.dpad_down)  pInputData->wButtons |= XINPUT_GAMEPAD_DPAD_DOWN;
+	}
+
+	pInputData->sThumbRX = b.z;
+	pInputData->sThumbRY = b.rz;
+	pInputData->sThumbLX = b.x;
+	pInputData->sThumbLY = b.y;
+	pInputData->bLeftTrigger = b.rx ? b.rx : (b.l2 ? 255 : 0);
+	pInputData->bRightTrigger = b.ry ? b.ry : (b.r2 ? 255 : 0);
+
+	if (pdwPacketNumber)
+		*pdwPacketNumber = ++c->packetNumber;
+	if (unk)
+		*unk = FALSE;
+
+	return STATUS_SUCCESS;
 }
 
 
@@ -3932,11 +3933,6 @@ BOOL APIENTRY DllMain(HANDLE Handle, DWORD Reason, PVOID Reserved) {
 		}
 
 		RM_LOG("RIFFMASTER: *** BUILD LADDER LEVEL %d ***\r\n", RIFFMASTER_LEVEL);
-#ifdef RIFFMASTER_GIP_ONLY
-		RM_LOG("RIFFMASTER: GIP-only mode - HID detours DISABLED (CRKD/UsbdSecPatch safe)\r\n");
-#else
-		RM_LOG("RIFFMASTER: HID detours ENABLED (may hijack unknown HID gamepads)\r\n");
-#endif
 
 		// Level 0 is the control: a plugin that loads into the same process, at the
 		// same base address, and then does nothing at all. If a disconnect freezes
@@ -4036,31 +4032,7 @@ BOOL APIENTRY DllMain(HANDLE Handle, DWORD Reason, PVOID Reserved) {
 		// Skipping it also makes the bugcheck patches unnecessary, since those exist
 		// solely to let this sequence run - which is why the earlier "skip the patches but
 		// still do the reset" build hung at boot.
-#ifndef RIFFMASTER_NO_USB_RESET
-		DbgPrint("EINTIM: Resetting USB driver!\n");
-		UsbdPowerDownNotification();
-
-		// For some reason microsoft doesnt clean up this page by themselves in the shutdown notification, so ill do it for them, call me mr nice guy :)
-		MmFreePhysicalMemory(0, *(DWORD*)UsbPhysicalPage);
-		DbgPrint("EINTIM: USB driver shutdown complete.\n");
-
-		UsbdDriverEntry();
-		DbgPrint("EINTIM: USB driver reset complete.\n");
-
-		// The USB driver reset is done, so the bugchecks are no longer in the way.
-		// Put them back: with fault containment restored, a USB fault at runtime
-		// (e.g. the guitar going to sleep) should raise a survivable exception the way
-		// it does with no plugin loaded, instead of hanging the console.
-		// OFF by default. Restoring the bugchecks did NOT fix the disconnect freeze, and
-		// it coincided with Rock Band and Guitar Hero failing to launch at all - so it
-		// is a suspected regression, not a neutral change. Only enable to re-test.
-#ifdef RIFFMASTER_RESTORE_BUGCHECKS
-		GipRestoreUsbBugchecks();
-#endif
-#else
 		RM_LOG("RIFFMASTER: USB driver reset SKIPPED - power the guitar on AFTER boot\r\n");
-#endif
-
 		// Start mapping manager thread.
 		// Not needed for the RiffMaster: our mapping is fixed and known, so the JSON
 		// mapping system and its background thread are dead weight (and the project's

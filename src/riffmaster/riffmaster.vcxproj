@@ -105,6 +105,8 @@
     <ClCompile Include="mapping.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="riffmaster_ps5.cpp" />
+    <None Include="riffmaster_ps5.h" />
     <None Include="xex.xml" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
